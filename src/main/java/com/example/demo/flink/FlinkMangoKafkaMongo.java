@@ -27,14 +27,23 @@ public class FlinkMangoKafkaMongo {
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
-    public static void main(String[] args) {
-        final String KAFKA_SERVERS = "localhost:9092";
-        final String KAFKA_TOPIC = "flinkmango-topic";
-        final String KAFKA_GROUP_ID = "flinkmango-flink-group";
+    // Kafka configuration
+    private static final String KAFKA_SERVERS = "localhost:9092";
+    private static final String KAFKA_TOPIC = "flinkmango-topic";
+    private static final String KAFKA_GROUP_ID = "flinkmango-flink-group";
+    private static final String KAFKA_USERNAME = "your-username";
+    private static final String KAFKA_PASSWORD = "your-password";
+    private static final String KAFKA_HEADER_TLOGID = "tlogId";
 
-        final String MONGO_URI = "mongodb://localhost:27017";
-        final String MONGO_DB = "testdb";
-        final String MONGO_COLLECTION = "json_data";
+    // MongoDB configuration
+    private static final String MONGO_URI = "mongodb://localhost:27017";
+    private static final String MONGO_DB = "testdb";
+    private static final String MONGO_COLLECTION = "json_data";
+    private static final int MONGO_BATCH_SIZE = 100;
+    private static final int MONGO_BATCH_INTERVAL_MS = 1000;
+    private static final int MONGO_MAX_RETRIES = 3;
+
+    public static void main(String[] args) {
 
         try {
             StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -50,6 +59,12 @@ public class FlinkMangoKafkaMongo {
                     .setGroupId(KAFKA_GROUP_ID)
                     .setStartingOffsets(OffsetsInitializer.earliest())
                     .setDeserializer(new PassThroughDeserializer())
+                    .setProperty("security.protocol", "SASL_SSL")
+                    .setProperty("sasl.mechanism", "PLAIN")
+                    .setProperty("sasl.jaas.config",
+                            "org.apache.kafka.common.security.plain.PlainLoginModule required "
+                                    + "username=\"" + KAFKA_USERNAME + "\" "
+                                    + "password=\"" + KAFKA_PASSWORD + "\";")
                     .build();
 
             // ---- Mongo Sink ----
@@ -60,6 +75,9 @@ public class FlinkMangoKafkaMongo {
                     .setUri(MONGO_URI)
                     .setDatabase(MONGO_DB)
                     .setCollection(MONGO_COLLECTION)
+                    .setBatchSize(MONGO_BATCH_SIZE)
+                    .setBatchIntervalMs(MONGO_BATCH_INTERVAL_MS)
+                    .setMaxRetries(MONGO_MAX_RETRIES)
                     .setSerializationSchema(serializationSchema)
                     .build();
 
@@ -72,11 +90,28 @@ public class FlinkMangoKafkaMongo {
 
             DataStream<Document> mongoStream = kafkaStream.map(record -> {
                 String jsonBody = new String(record.value(), StandardCharsets.UTF_8);
-                JsonData enriched = parseAndEnrichJson(jsonBody);
-                return Document.parse(objectMapper.writeValueAsString(enriched));
-            });
 
-            mongoStream.sinkTo(mongoSink);
+                // Parse and enrich JSON as POJO
+                JsonData data = parseAndEnrichJson(jsonBody);
+
+                if (data == null) return null;
+
+                Document document = Document.parse(objectMapper.writeValueAsString(data));
+
+                // Extract tlogId header if present
+                byte[] tlogIdBytes = record.headers().lastHeader(KAFKA_HEADER_TLOGID) != null
+                        ? record.headers().lastHeader(KAFKA_HEADER_TLOGID).value()
+                        : null;
+
+                if (tlogIdBytes != null && tlogIdBytes.length > 0) {
+                    String tlogId = new String(tlogIdBytes, StandardCharsets.UTF_8);
+                    document.put(KAFKA_HEADER_TLOGID, tlogId);
+                }
+
+                return document;
+            }).name("Parse, Enrich & Extract Header");
+
+            mongoStream.sinkTo(mongoSink).name("MongoDB_Sink");
 
             env.execute("FlinkMango Kafka to MongoDB Job");
 
@@ -86,12 +121,11 @@ public class FlinkMangoKafkaMongo {
     }
 
     // ---- Helper Methods ----
-
     public static JsonData parseAndEnrichJson(JsonData data) {
         if (data == null) return null;
         data.setTlogId("TLOG-" + UUID.randomUUID());
         if (data.getName() != null) data.setName(data.getName() + "-enriched");
-        data.setAge(data.getAge() + 1);
+        data.setAge(data.getAge());
         return data;
     }
 
@@ -105,6 +139,7 @@ public class FlinkMangoKafkaMongo {
         }
     }
 
+    // ---- Custom Deserializer ----
     public static class PassThroughDeserializer
             implements KafkaRecordDeserializationSchema<ConsumerRecord<byte[], byte[]>> {
 
